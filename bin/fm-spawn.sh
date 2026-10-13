@@ -401,7 +401,7 @@
 #   docs/configuration.md "Worker tool exclusions" owns config/crew-exclude-tools
 #   and its operator contract. Resolve it with bin/fm-exclude-tools-lib.sh
 #   before provisioning; __PIEXCLUDE__ below owns the Pi launch substitution.
-# Worker account pin (config/claude-account, config/pi-account):
+# Worker account pin (config/claude-account, config/codex-account, config/pi-account):
 #   Opt-in. With no file, a Claude or Pi launch is unchanged: Claude still
 #   receives this process's own CLAUDE_CONFIG_DIR when it is set, and Pi the
 #   destination pane's ambient account. A present file pins every launch of
@@ -415,6 +415,11 @@
 #   raw Pi command refuses. The pin is recorded as account= (and Pi's
 #   account_provider=) in the task record and on the spawned line. A local
 #   secondmate reads this launching home's file; pins are never inherited.
+#   config/codex-account pins Codex the same way through CODEX_HOME. A file
+#   listing several roots is an account pool: the launch takes the root with
+#   the most headroom, exits 75 when every root is out of usage, and a pooled
+#   Claude ship or scout also gets a StopFailure rate_limit|billing_error hook
+#   that feeds bin/fm-account-rotate.sh.
 #   bin/fm-worker-account-lib.sh owns parsing, the check, and the shed list.
 #   Launch templates live in launch_template() below; placeholders replaced before launch:
 #     __BRIEF__    absolute path to data/<task-id>/brief.md
@@ -2695,11 +2700,17 @@ fi
 # trust registration below writes the store the worker will actually read.
 RAW_COMMAND=
 [ "$RAW_LAUNCH" = 0 ] || RAW_COMMAND=$ARG3
-WORKER_ACCOUNT=$(fm_worker_account_select "$HARNESS" "$CONFIG" "$MODEL" "${PI_BIN:-$HARNESS}" "$RAW_COMMAND") || exit 1
+# A pool's readings and limit records live under this home's state/, and a
+# pool whose every account is out of usage exits 75 so the work stays queued.
+WORKER_ACCOUNT=$(FM_WORKER_ACCOUNT_STATE_DIR=$STATE fm_worker_account_select "$HARNESS" "$CONFIG" "$MODEL" "${PI_BIN:-$HARNESS}" "$RAW_COMMAND") || exit $?
 WORKER_ACCOUNT_DECLARED=${WORKER_ACCOUNT%%$'\t'*}
 WORKER_ACCOUNT_ROOT=${WORKER_ACCOUNT#*$'\t'}
 WORKER_ACCOUNT_PROVIDER=${WORKER_ACCOUNT_ROOT#*$'\t'}
 WORKER_ACCOUNT_ROOT=${WORKER_ACCOUNT_ROOT%%$'\t'*}
+WORKER_ACCOUNT_POOLED=0
+if [ -n "$WORKER_ACCOUNT" ] && [ "$(fm_worker_account_resolve "$HARNESS" "$CONFIG" | wc -l)" -gt 1 ]; then
+  WORKER_ACCOUNT_POOLED=1
+fi
 if [ -n "$WORKER_ACCOUNT" ] && [ "$HARNESS" = claude ]; then
   if [ -n "$WORKER_ACCOUNT_ROOT" ]; then
     export CLAUDE_CONFIG_DIR=$WORKER_ACCOUNT_ROOT
@@ -4969,7 +4980,14 @@ BUSY_GEN=
       j_stop=$(json_escape "${stop_turnend}$busy_cmd_prefix idle $busy_suffix --event stop 2>/dev/null || true")
       stop_entry="\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_stop\"}]}],"
     fi
-    hooks_json="\"hooks\":{\"UserPromptSubmit\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_submit\"}]}],${stop_entry}\"StopFailure\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_stopfail\"}]}],\"SessionEnd\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_sessionend\"}]}]}"
+    # A ship or scout on a pooled account also reports a turn that ended on a
+    # usage or billing limit, so bin/fm-account-rotate.sh can move it.
+    limit_entry=
+    if [ "$WORKER_ACCOUNT_POOLED" = 1 ] && [ "$KIND" != secondmate ]; then
+      j_limit=$(json_escape "$(shell_quote "$FM_ROOT/bin/fm-account-rotate.sh") hint $(shell_quote "$STATE_REAL") $(shell_quote "$ID") 2>/dev/null || true")
+      limit_entry=",{\"matcher\":\"rate_limit|billing_error\",\"hooks\":[{\"type\":\"command\",\"command\":\"$j_limit\"}]}"
+    fi
+    hooks_json="\"hooks\":{\"UserPromptSubmit\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_submit\"}]}],${stop_entry}\"StopFailure\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_stopfail\"}]}${limit_entry}],\"SessionEnd\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_sessionend\"}]}]}"
     if [ "$KIND" = secondmate ]; then
       session_keys='"feedbackDrafts":"off",'
       if [ "$KEEP_AI_TRAILERS" != 1 ]; then
@@ -5676,6 +5694,13 @@ if [ -n "$WORKER_ACCOUNT" ]; then
       LAUNCH="$(fm_worker_account_claude_shed) CLAUDE_CONFIG_DIR=$(shell_quote "$WORKER_ACCOUNT_ROOT") $LAUNCH"
     else
       LAUNCH="$(fm_worker_account_claude_shed) -u CLAUDE_CONFIG_DIR $LAUNCH"
+    fi
+    ;;
+  codex)
+    if [ -n "$WORKER_ACCOUNT_ROOT" ]; then
+      LAUNCH="CODEX_HOME=$(shell_quote "$WORKER_ACCOUNT_ROOT") $LAUNCH"
+    else
+      LAUNCH="env -u CODEX_HOME $LAUNCH"
     fi
     ;;
   pi | pi-signed)

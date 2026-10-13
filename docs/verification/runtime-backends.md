@@ -621,13 +621,23 @@ None of these three runs ever answered its dialog (Escape only, never Enter), so
 
 ## Worker account pin sign-in check
 
-`bin/fm-worker-account-lib.sh` decides whether a pinned account is signed in from vendor output: the exit status of `claude auth status`, the JSON of `pi auth check`, and the provider column of `pi --list-models`.
+`bin/fm-worker-account-lib.sh` decides whether a pinned account is signed in from vendor output: the exit status of `claude auth status` and `codex login status`, the JSON of `pi auth check`, and the provider column of `pi --list-models`.
 `tests/fm-worker-account-live-e2e.test.sh` asks the real installed runners about synthetic roots that need no login and no network, under a throwaway `HOME`.
 A Claude root whose `settings.json` names an `apiKeyHelper` reports `loggedIn: true`, a Pi root holding a stored API key reports `ready`, and a provider registered by an extension in the Pi root's `extensions/` answers `pi auth check` with `not_ready`/`provider_not_found` while `pi --list-models` lists it.
 Each refusal is paired with the divergence it depends on: the same runner, given `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or the extension's key variable, answers signed in for the empty root, so the refusal proves the check's cleared environment.
 Replacing `env -i` with `env` in the check makes the guard fail on the Claude refusal.
 
 Verified 2026-09-22 on Claude Code 2.1.278 and pi 0.86.1 on Linux; pi-signed was not installed.
+
+A `CODEX_HOME` holding a key stored offline by `codex login --with-api-key` answers `codex login status` with exit 0, and an empty one answers `Not logged in` with exit 1 even when `OPENAI_API_KEY` is set.
+An account pool reads an empty root through `quota-axi --profile-only` as unmeasured, never as measured headroom.
+Verified 2026-10-13 on macOS with Claude Code 2.1.296, codex-cli 0.159.0, pi 0.85.1, and quota-axi 0.1.57; pi-signed was not installed:
+
+```text
+ok - claude 2.1.296 (Claude Code): the pin check accepts a signed-in root and refuses an empty one despite an ambient API key
+ok - codex-cli 0.159.0: the pin check accepts a signed-in CODEX_HOME and refuses an empty one, which the pool reads as unmeasured
+ok - pi 0.85.1: the pin check reads auth check and the model listing, and refuses what only an ambient credential signs in
+```
 
 ```sh
 bash tests/fm-worker-account-live-e2e.test.sh

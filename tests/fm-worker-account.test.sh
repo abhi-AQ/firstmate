@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Behavior tests for the opt-in per-home worker account pin
-# (config/claude-account, config/pi-account; bin/fm-worker-account-lib.sh).
+# (config/claude-account, config/codex-account, config/pi-account;
+# bin/fm-worker-account-lib.sh), including multi-root account pools.
 #
 # Each case drives the real fm-spawn.sh through the shared fake tmux, which
 # records the launch command, then runs that command in a synthetic pane whose
@@ -384,6 +385,162 @@ test_local_secondmate_reads_the_launching_home_pin() {
   pass "a local secondmate reads the launching home's pin and its own home's file is never inherited over"
 }
 
+# make_pool_fakes <fakebin> <case-dir>
+# A fake quota-axi that answers a profile-only read from the selected root's
+# quota.json fixture (and fails like the real tool for a root without one), and
+# a fake codex whose login status reads the selected CODEX_HOME.
+make_pool_fakes() {
+  local fakebin=$1 dir=$2
+  cat > "$fakebin/quota-axi" <<SH
+#!/usr/bin/env bash
+case " \$* " in *" --provider codex "*) root=\$CODEX_HOME ;; *) root=\$CLAUDE_CONFIG_DIR ;; esac
+printf '%s\n' "\$root" >> '$dir/quota-calls'
+if [ -f "\$root/quota.json" ]; then cat "\$root/quota.json"; exit 0; fi
+printf '{"schemaVersion":5,"providers":[{"provider":"claude","windows":[],"state":{"status":"unavailable","error":"profile credentials missing"},"quotaSemantics":{"status":"unknown","effectiveAvailability":[]}}]}\n'
+exit 1
+SH
+  cat > "$fakebin/codex" <<SH
+#!/usr/bin/env bash
+if [ "\${1:-}" = login ] && [ "\${2:-}" = status ]; then
+  [ -f "\${CODEX_HOME:-\$HOME/.codex}/auth.json" ]
+  exit
+fi
+printf 'CODEX_HOME=%s\n' "\${CODEX_HOME-unset}" > '$dir/codex-worker'
+SH
+  chmod +x "$fakebin/quota-axi" "$fakebin/codex"
+}
+
+# quota_fixture <root> <percent-remaining> [<reset-iso>]
+# A profile-only reading of <root>; 0 percent is an exhausted window.
+quota_fixture() {
+  local root=$1 percent=$2 reset=${3:-2099-01-01T00:00:00.000Z} runway=through_reset
+  [ "$percent" != 0 ] || runway=exhausted_now
+  cat > "$root/quota.json" <<JSON
+{"schemaVersion":5,"providers":[{"provider":"claude","account":{"accountId":"acct-${root##*/}"},
+ "windows":[{"id":"five_hour","percentRemaining":$percent,"resetsAt":"$reset"}],
+ "state":{"status":"fresh","stale":false},
+ "quotaSemantics":{"status":"known","effectiveAvailability":[{"scope":"all_models","status":"known",
+  "effectivePercentRemaining":$percent,"runway":{"status":"$runway"}}]}}]}
+JSON
+}
+
+test_claude_pool_picks_the_signed_in_root_with_most_headroom() {
+  local out rc id=acct-pool calls
+  new_case pool claude
+  make_pool_fakes "$FAKEBIN" "$CASE"
+  signed_in_claude_root "$CASE/low"; quota_fixture "$CASE/low" 20
+  signed_in_claude_root "$CASE/high"; quota_fixture "$CASE/high" 80
+  signed_in_claude_root "$CASE/spent"; quota_fixture "$CASE/spent" 0
+  mkdir -p "$CASE/signed-out"; quota_fixture "$CASE/signed-out" 95
+  printf '%s\n' "$CASE/spent" "$CASE/signed-out" "$CASE/low" "$CASE/high" > "$HOME_DIR/config/claude-account"
+  out=$(spawn_ship "$id"); rc=$?
+  expect_code 0 "$rc" "a pooled Claude spawn should succeed: $out"
+  assert_contains "$out" "account=$CASE/high" "the spawn should report the signed-in root with the most headroom"
+  assert_grep "account=$CASE/high" "$HOME_DIR/state/$id.meta" "the task record should carry the chosen root"
+  assert_no_grep "$CASE/spent" "$CASE/claude-checks" "an exhausted root must be skipped before any sign-in check"
+  assert_grep "$CASE/signed-out" "$CASE/claude-checks" "the root reading the most headroom is checked first"
+  assert_grep '"matcher":"rate_limit|billing_error"' "$WT/.claude/settings.local.json" \
+    "a pooled Claude ship should report a turn that ends on a usage limit"
+  run_pane
+  assert_grep "CLAUDE_CONFIG_DIR=$CASE/high" "$CASE/claude-worker" "the worker should run under the chosen root"
+  assert_grep "ANTHROPIC_API_KEY=unset" "$CASE/claude-worker" "a pooled launch sheds credentials like a pin"
+  calls=$(wc -l < "$CASE/quota-calls")
+  out=$(spawn_ship "$id-again"); rc=$?
+  expect_code 0 "$rc" "a second pooled spawn should succeed: $out"
+  [ "$(wc -l < "$CASE/quota-calls")" -eq "$calls" ] \
+    || fail "a burst of spawns must reuse the cached readings: $(cat "$CASE/quota-calls")"
+  pass "a Claude pool picks the signed-in root with the most headroom, skips exhausted and signed-out roots, records it, and caches readings"
+}
+
+test_pool_unmeasured_roots_rank_after_measured_ones_and_keep_file_order() {
+  local out rc id=acct-pool-unmeasured
+  new_case pool-unmeasured claude
+  make_pool_fakes "$FAKEBIN" "$CASE"
+  signed_in_claude_root "$CASE/keychain-a"
+  signed_in_claude_root "$CASE/keychain-b"
+  signed_in_claude_root "$CASE/measured"; quota_fixture "$CASE/measured" 5
+  printf '%s\n' "$CASE/keychain-a" "$CASE/keychain-b" "$CASE/measured" > "$HOME_DIR/config/claude-account"
+  out=$(spawn_ship "$id"); rc=$?
+  expect_code 0 "$rc" "a pool with one measured root should succeed: $out"
+  assert_contains "$out" "account=$CASE/measured" "measured headroom outranks an unmeasurable root"
+  quota_fixture "$CASE/measured" 0
+  rm -rf "${HOME_DIR:?}/state/account-pool"
+  out=$(spawn_ship "$id-2"); rc=$?
+  expect_code 0 "$rc" "unmeasured roots should still launch when the measured one is spent: $out"
+  assert_contains "$out" "account=$CASE/keychain-a" "unmeasured roots keep file order"
+  pass "unmeasurable pool roots rank after measured ones and keep file order"
+}
+
+test_exhausted_pool_exits_75_with_the_earliest_reset() {
+  local out rc id=acct-pool-spent
+  new_case pool-spent claude
+  make_pool_fakes "$FAKEBIN" "$CASE"
+  signed_in_claude_root "$CASE/a"; quota_fixture "$CASE/a" 0 2099-01-02T05:00:00.000Z
+  signed_in_claude_root "$CASE/b"; quota_fixture "$CASE/b" 0 2099-01-01T03:00:00.000Z
+  printf '%s\n' "$CASE/a" "$CASE/b" > "$HOME_DIR/config/claude-account"
+  out=$(spawn_ship "$id"); rc=$?
+  expect_code 75 "$rc" "a pool whose every root is out of usage must leave the work queued: $out"
+  assert_refused_before_launch "$id" "$out" "out of usage until at least 2099-01-01T03:00Z"
+  rm -f "$CASE/a/.credentials.json" "$CASE/b/.credentials.json"
+  rm -rf "${HOME_DIR:?}/state/account-pool"
+  quota_fixture "$CASE/a" 50; quota_fixture "$CASE/b" 50
+  out=$(spawn_ship "$id-out"); rc=$?
+  expect_code 1 "$rc" "a pool with no signed-in root is a plain refusal"
+  assert_refused_before_launch "$id-out" "$out" "no account in config/claude-account is signed in"
+  pass "an exhausted pool exits 75 naming the earliest reset, and a signed-out pool refuses"
+}
+
+test_duplicate_logins_share_one_limit_record() {
+  local out rc id=acct-pool-dup
+  new_case pool-dup claude
+  make_pool_fakes "$FAKEBIN" "$CASE"
+  signed_in_claude_root "$CASE/same-1"
+  signed_in_claude_root "$CASE/same-2"
+  signed_in_claude_root "$CASE/other"
+  printf '{"oauthAccount":{"accountUuid":"u-1"}}\n' > "$CASE/same-1/.claude.json"
+  printf '{"oauthAccount":{"accountUuid":"u-1"}}\n' > "$CASE/same-2/.claude.json"
+  printf '{"oauthAccount":{"accountUuid":"u-2"}}\n' > "$CASE/other/.claude.json"
+  printf '%s\n' "$CASE/same-1" "$CASE/same-2" "$CASE/other" > "$HOME_DIR/config/claude-account"
+  # shellcheck disable=SC2016  # The inner shell expands its own positional arguments.
+  env FM_WORKER_ACCOUNT_STATE_DIR="$HOME_DIR/state" HOME="$HOME_DIR/user-home" PATH="$FAKEBIN:$PATH" bash -c \
+    '. "$1/bin/fm-worker-account-lib.sh" && fm_worker_account_pool_mark_limited claude "$2" 4102444800' \
+    _ "$ROOT" "$CASE/same-1" || fail "marking a root limited should succeed"
+  out=$(spawn_ship "$id"); rc=$?
+  expect_code 0 "$rc" "a pool with one untouched account should launch: $out"
+  assert_contains "$out" "account=$CASE/other" "a second root signed in to the limited account must be skipped too"
+  printf '%s\n' "$CASE/same-1" "$CASE/same-1" > "$HOME_DIR/config/claude-account"
+  out=$(spawn_ship "$id-repeat"); rc=$?
+  expect_code 1 "$rc" "a repeated root must refuse"
+  assert_refused_before_launch "$id-repeat" "$out" "a pool of distinct entries"
+  pass "roots signed in to one account share its limit record, and a repeated root refuses"
+}
+
+test_codex_pool_selects_codex_home() {
+  local out rc id=acct-codex-pool
+  new_case codex-pool codex
+  make_pool_fakes "$FAKEBIN" "$CASE"
+  mkdir -p "$CASE/cx-a" "$CASE/cx-b" "$HOME_DIR/user-home/.codex"
+  : > "$CASE/cx-a/auth.json"; quota_fixture "$CASE/cx-a" 10
+  : > "$CASE/cx-b/auth.json"; quota_fixture "$CASE/cx-b" 60
+  printf '%s\n' "$CASE/cx-a" "$CASE/cx-b" > "$HOME_DIR/config/codex-account"
+  out=$(spawn_ship "$id"); rc=$?
+  expect_code 0 "$rc" "a pooled Codex spawn should succeed: $out"
+  assert_contains "$out" "account=$CASE/cx-b" "the Codex root with the most headroom wins"
+  assert_grep "account=$CASE/cx-b" "$HOME_DIR/state/$id.meta" "the task record should carry the chosen CODEX_HOME"
+  run_pane
+  assert_grep "CODEX_HOME=$CASE/cx-b" "$CASE/codex-worker" "the Codex worker should run under the chosen CODEX_HOME"
+  printf 'ordinary\n' > "$HOME_DIR/config/codex-account"
+  out=$(spawn_ship "$id-ordinary"); rc=$?
+  expect_code 1 "$rc" "an ordinary Codex pin with no default login must refuse"
+  assert_refused_before_launch "$id-ordinary" "$out" "config/codex-account pins Codex workers to the ordinary account"
+  : > "$HOME_DIR/user-home/.codex/auth.json"
+  out=$(spawn_ship "$id-ordinary-in"); rc=$?
+  expect_code 0 "$rc" "an ordinary Codex pin with a default login should launch: $out"
+  run_pane
+  assert_grep "CODEX_HOME=unset" "$CASE/codex-worker" "the ordinary Codex account leaves CODEX_HOME unset"
+  pass "a Codex pool selects a CODEX_HOME by headroom, and a one-line Codex pin keeps its meaning"
+}
+
 test_absent_pin_keeps_the_launch_unchanged
 test_claude_pin_selects_the_root_and_sheds_ambient_credentials
 test_claude_pin_refuses_a_signed_out_root_despite_an_ambient_login
@@ -397,5 +554,10 @@ test_raw_claude_command_receives_the_pin
 test_raw_claude_account_override_refuses_under_a_pin
 test_raw_claude_account_override_is_kept_without_a_pin
 test_local_secondmate_reads_the_launching_home_pin
+test_claude_pool_picks_the_signed_in_root_with_most_headroom
+test_pool_unmeasured_roots_rank_after_measured_ones_and_keep_file_order
+test_exhausted_pool_exits_75_with_the_earliest_reset
+test_duplicate_logins_share_one_limit_record
+test_codex_pool_selects_codex_home
 
 echo "# all fm-worker-account tests passed"

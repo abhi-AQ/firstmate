@@ -155,6 +155,11 @@
 #                          budget and is parked until a probe reads it live
 #                          again (FM_SECONDMATE_LIVENESS_MAX_ATTEMPTS and
 #                          FM_SECONDMATE_LIVENESS_WINDOW_SECS)
+#   check: <id> moved to another account after a usage limit (<from> -> <to>)
+#   check: <id> could not move off its exhausted account: <detail>
+#   check: account pool <harness> is out of usage; ...
+#                          account_rotation_tick relays bin/fm-account-rotate.sh
+#                          tick, which owns these reasons and their policy
 # For normal supervision, resume the session-start primary-harness protocol
 # after each printed reason. Direct duplicate invocations of this script still
 # no-op through the watcher singleton lock. A live holder whose beacon is stale
@@ -373,6 +378,8 @@ case "$SECONDMATE_LIVENESS_TIMEOUT" in ''|*[!0-9]*|0) SECONDMATE_LIVENESS_TIMEOU
 # it alive again, so a flapping endpoint cannot relaunch forever unseen.
 SECONDMATE_LIVENESS_MAX_ATTEMPTS=${FM_SECONDMATE_LIVENESS_MAX_ATTEMPTS:-}
 case "$SECONDMATE_LIVENESS_MAX_ATTEMPTS" in ''|*[!0-9]*|0) SECONDMATE_LIVENESS_MAX_ATTEMPTS=3 ;; esac
+ACCOUNT_ROTATION_SECS=${FM_ACCOUNT_ROTATE_SECS:-}
+case "$ACCOUNT_ROTATION_SECS" in ''|*[!0-9]*|0) ACCOUNT_ROTATION_SECS=120 ;; esac
 SECONDMATE_LIVENESS_WINDOW_SECS=${FM_SECONDMATE_LIVENESS_WINDOW_SECS:-}
 case "$SECONDMATE_LIVENESS_WINDOW_SECS" in ''|*[!0-9]*|0) SECONDMATE_LIVENESS_WINDOW_SECS=3600 ;; esac
 # A crew that declared a pause is idling on a known external wait, so its stale
@@ -1144,6 +1151,30 @@ secondmate_liveness_tick() {
   done
   [ -z "$first_reason" ] || wake "$first_reason"
   [ "$failed" -eq 0 ]
+}
+
+# Account-pool rotation (bin/fm-account-rotate.sh owns the policy): only a home
+# whose config/claude-account or config/codex-account lists several roots runs
+# it, on its own bounded cadence. Each printed reason becomes one durable check
+# row, and the first wakes the cycle.
+account_rotation_tick() {
+  local tick_marker="$STATE/.account-rotation-tick" reason key first_reason=''
+  [ "$(cat "$CONFIG/claude-account" "$CONFIG/codex-account" 2>/dev/null | awk 'NF { n++ } END { print n + 0 }')" -gt 1 ] || return 0
+  [ "$(age_of "$tick_marker")" -ge "$ACCOUNT_ROTATION_SECS" ] || return 0
+  touch "$tick_marker" || return 1
+  while IFS= read -r reason; do
+    [ -n "$reason" ] || continue
+    key="account-rotation-$(printf '%s' "$reason" | cksum | cut -d' ' -f1)"
+    if printf '%s\n' "$(fm_wake_queued_keys check)" | grep -Fx "$key" >/dev/null 2>&1 \
+      || fm_wake_append check "$key" "$reason"; then
+      [ -n "$first_reason" ] || first_reason=$reason
+    else
+      triage_log "account rotation: check wake row could not be queued: $reason" || true
+    fi
+  done < <(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_CONFIG_OVERRIDE="$CONFIG" \
+    "$SCRIPT_DIR/fm-account-rotate.sh" tick 2>/dev/null)
+  [ -z "$first_reason" ] || wake "$first_reason"
+  return 0
 }
 
 # Consecutive wedge-escalation count for a window past FM_WEDGE_DEMAND_INSPECT_COUNT
@@ -2783,6 +2814,11 @@ while :; do
   # any relaunch and the restarted watcher will not re-probe early.
   secondmate_liveness_tick || {
     echo "watcher: secondmate liveness check failed" >&2
+    exit 1
+  }
+
+  account_rotation_tick || {
+    echo "watcher: account rotation check failed" >&2
     exit 1
   }
 

@@ -9,7 +9,7 @@ Start with the directory layout, then use the setting reference for the behavior
 | --- | --- |
 | Firstmate's code, private files, or project location | [FM_HOME](#fm_home) and [operational home layout](#operational-home-layout-and-state) |
 | Task windows and worker tools | [Runtime backend](#runtime-backend-configbackend--fm_backend) and [harness support](#harness-support) |
-| Worker permissions, accounts, or environment | [Claude permission mode](#claude-permission-mode-configclaude-permission-mode), [worker account pin](#worker-account-pin-configclaude-account-configpi-account), [worker tool exclusions](#worker-tool-exclusions-configcrew-exclude-tools), [worker launch environment](#worker-launch-environment-configlaunch-env-allowlist), and its [Orca environment source](#orca-environment-source-configlaunch-env-tmux-session) |
+| Worker permissions, accounts, or environment | [Claude permission mode](#claude-permission-mode-configclaude-permission-mode), [worker account pin](#worker-account-pin-configclaude-account-configcodex-account-configpi-account), [worker tool exclusions](#worker-tool-exclusions-configcrew-exclude-tools), [worker launch environment](#worker-launch-environment-configlaunch-env-allowlist), and its [Orca environment source](#orca-environment-source-configlaunch-env-tmux-session) |
 | Backlog, preferences, and memory | [Backlog backend](#backlog-backend-taskstoml--configbacklog-backend), [captain preferences](#captain-preferences-datacaptainmd--datacaptain-sharedmd), [external memory tiers](#external-memory-tiers-memory-layering-section), and [startup memory budget](#startup-memory-budget-configstartup-memory-budget) |
 | Supervision and presentation | [Pi supervision branch](#pi-supervision-branch), [supervision host](#supervision-host-configsupervision-host), and [Calm preference](#calm-preference-configcalm) |
 | Persistent secondmates | [Secondmate routes](#secondmate-routes-datasecondmatesmd) |
@@ -971,9 +971,10 @@ Each relaunch installs a fresh worker extension with the home's current list, so
 
 [`bin/fm-exclude-tools-lib.sh`](../bin/fm-exclude-tools-lib.sh) implements parsing and pre-launch validation for this contract; [`bin/fm-spawn.sh`](../bin/fm-spawn.sh)'s header owns the launch-flag mechanics.
 
-## Worker account pin (config/claude-account, config/pi-account)
+## Worker account pin (config/claude-account, config/codex-account, config/pi-account)
 
-A home that mixes accounts for one runner, such as a work login and a personal one, can pin the account its own Claude and Pi workers launch on.
+A home that mixes accounts for one runner, such as a work login and a personal one, can pin the account its own Claude, Codex, and Pi workers launch on.
+A Claude or Codex pin can also list several accounts as a pool that new and limit-hit workers rotate through.
 The pin is opt-in: with neither file, every launch is unchanged, and Claude workers keep receiving firstmate's own `CLAUDE_CONFIG_DIR` when it is set.
 
 Both files are local and gitignored.
@@ -981,11 +982,13 @@ Both files are local and gitignored.
 | Runner | File | Variable the launch receives | `ordinary` means |
 | --- | --- | --- | --- |
 | `claude` | `config/claude-account` | `CLAUDE_CONFIG_DIR` | the variable unset, so Claude uses its default login |
+| `codex` | `config/codex-account` | `CODEX_HOME` | the variable unset, so Codex uses `~/.codex` |
 | `pi`, `pi-signed` | `config/pi-account` | `PI_CODING_AGENT_DIR` | `~/.pi/agent` |
 
 ### File format and provider selection
 
-`config/claude-account` holds one line: `ordinary`, or the absolute path of an existing Claude config directory.
+`config/claude-account` and `config/codex-account` hold one line: `ordinary`, or the absolute path of an existing Claude config directory or Codex home.
+Several lines make an account pool, described below.
 `config/pi-account` holds that same root on line 1 and, on line 2, the providers this home may spend, separated by spaces, for example `openai-codex anthropic`.
 
 A final newline is optional; any other line, a relative path, or a control character such as a CR refuses.
@@ -999,17 +1002,50 @@ An unqualified model, an undeclared provider, or a raw Pi launch command, which 
 ### Launch scope and sign-in checks
 
 When a file is present, every launch of that runner from this home uses it: ships, scouts, local secondmate agents, raw Claude launch commands, and relaunches.
-A raw Claude launch command refuses if its leading assignments set `CLAUDE_CONFIG_DIR` or a credential that a pinned launch unsets, such as `ANTHROPIC_API_KEY`.
+A raw Claude launch command refuses if its leading assignments set `CLAUDE_CONFIG_DIR` or a credential that a pinned launch unsets, such as `ANTHROPIC_API_KEY`, and a raw Codex launch command refuses if they set `CODEX_HOME`.
 The assignment would override the pin.
 The refusal names the variable; remove that assignment from the raw command, or change or remove `config/claude-account`.
 
-Before any worker endpoint, local copy, or task record exists, and before a relaunch stops the running worker, Firstmate asks the runner itself whether the pinned account is signed in: `claude auth status` for Claude, and `pi auth check --provider <provider> --json --no-refresh` for Pi, falling back to `pi --list-models <provider>` for a provider an extension registers.
+Before any worker endpoint, local copy, or task record exists, and before a relaunch stops the running worker, Firstmate asks the runner itself whether the pinned account is signed in: `claude auth status` for Claude, `codex login status` for Codex, and `pi auth check --provider <provider> --json --no-refresh` for Pi, falling back to `pi --list-models <provider>` for a provider an extension registers.
 The check runs with only `HOME`, `PATH`, `TMPDIR`, `USER`, `LOGNAME`, and the pinned root in its environment, so a credential variable in firstmate's own environment cannot answer for an empty root.
 
 A pinned Claude launch also unsets the environment credentials Claude ranks above a stored login, such as `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, and the Bedrock and Vertex switches ([authentication precedence](https://code.claude.com/docs/en/authentication#authentication-precedence)).
-Pi ranks a root's stored logins above environment variables, so a pinned Pi launch unsets nothing.
+Pi ranks a root's stored logins above environment variables, so a pinned Pi launch unsets nothing, and a pinned Codex launch unsets nothing either.
 
 A home that authenticates Claude through environment credentials on purpose should leave the pin absent.
+
+### Account pools
+
+List several accounts, one root per line, to let one home spend all of them instead of running one up into extra usage:
+
+```text
+/home/me/.claude-accts/a
+/home/me/.claude-accts/b
+ordinary
+```
+
+Each root holds one account that the operator signed in separately, for example `CLAUDE_CONFIG_DIR=<root> claude auth login` or `CODEX_HOME=<root> codex login`.
+A pool may include `ordinary`, which still launches with the variable unset and is read through `~/.claude` or `~/.codex`; a repeated line refuses.
+Firstmate never swaps a login, copies a credential, or changes the account a running worker uses.
+The Claude-or-Codex choice stays with [dispatch profiles](#crew-dispatch-profiles-configcrew-dispatchjson); a pool only chooses which account a launch of that runner spends.
+
+At every spawn and relaunch, Firstmate reads each root's headroom with `quota-axi --provider <runner> --profile-only --full --json` under that root's variable, which reads only the root's own credential file, never a macOS Keychain.
+Readings are cached for 60 seconds (`FM_ACCOUNT_POOL_CACHE_SECONDS`) under `state/account-pool/`, so a burst of spawns asks each vendor once.
+A root whose reading is exhausted, or that carries a limit record from an earlier limit, is skipped.
+Measured roots rank by their lowest remaining percent, a root `quota-axi` cannot read (such as a Keychain-only Claude login on a Mac) ranks after them, ties keep file order, and the first ranked root whose sign-in check passes is used.
+Limit records are keyed by account identity, Claude's `oauthAccount.accountUuid` or the account id `quota-axi` reports for Codex, so two roots signed in to the same account are limited together.
+When every root is out of usage the spawn exits 75 without launching, naming the earliest reset, so the work stays queued like a capacity refusal.
+
+A running worker that hits its account's limit moves without operator action.
+On a pooled home the watcher runs [`bin/fm-account-rotate.sh`](../bin/fm-account-rotate.sh) every 120 seconds (`FM_ACCOUNT_ROTATE_SECS`) over this home's ships and scouts.
+Limit evidence is a pooled Claude worker's `StopFailure` hook firing on `rate_limit` or `billing_error`, or an exhausted reading of the worker's own account.
+The account then gets a limit record until its earliest reset, or for an hour (`FM_ACCOUNT_POOL_BACKOFF_SECS`) when no reset is known, and the worker is relaunched onto the best remaining account through [`fm-control.sh relaunch`](agent-control.md), keeping its local copy and instructions.
+When no account has headroom the worker waits instead of failing and one notice reports the pool exhausted until the earliest reset.
+Once its own account resets it is told to continue in the same conversation, and if another account frees up first it is relaunched there.
+A worker whose latest status is done, failed, needs-decision, blocked, paused, or captain-held, or that is provably busy, is never moved.
+
+Pools are per home: each host and each secondmate home lists the accounts signed in on that machine in its own files, so a remote home on a devbox rotates through that devbox's logins.
+How much work each host or runner carries is a routing and dispatch-profile choice, not a pool setting.
 
 ### Failures, reporting, and inheritance
 
@@ -1019,7 +1055,7 @@ The spawn prints the pin as `account=` (plus `account_provider=` for Pi) and rec
 Pins are not inherited into secondmate homes: a local secondmate agent launches on the launching home's pin, while the secondmate's own workers read the secondmate home's files.
 A remote secondmate is launched on its host from its own home's configuration, so create the file in that remote home.
 
-[`bin/fm-worker-account-lib.sh`](../bin/fm-worker-account-lib.sh) owns parsing, the sign-in check, and the full list of credentials a Claude launch unsets; [runtime backend verification](verification/runtime-backends.md#worker-account-pin-sign-in-check) records the check against the real runners.
+[`bin/fm-worker-account-lib.sh`](../bin/fm-worker-account-lib.sh) owns parsing, pool ranking, the sign-in check, and the full list of credentials a Claude launch unsets, and [`bin/fm-account-rotate.sh`](../bin/fm-account-rotate.sh) owns moving running workers; [runtime backend verification](verification/runtime-backends.md#worker-account-pin-sign-in-check) records the check against the real runners.
 
 ## Lavish server address (config/lavish-axi-host)
 

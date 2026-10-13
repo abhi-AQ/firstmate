@@ -3,8 +3,8 @@
 # (bin/fm-worker-account-lib.sh) against every installed runner it supports.
 #
 # The check's verdict comes from vendor output - the exit status of
-# `claude auth status`, the JSON of `pi auth check`, and the table of
-# `pi --list-models` - so a fake can only restate the assumption written into
+# `claude auth status` and `codex login status`, the JSON of `pi auth check`,
+# and the table of `pi --list-models` - so a fake can only restate the assumption written into
 # it. This guard asks the REAL installed runners about synthetic account roots
 # that need no login and no network: a Claude root whose settings name an
 # apiKeyHelper, a Pi root holding a stored API key, and Pi roots whose only
@@ -14,8 +14,8 @@
 # environment at work rather than a root the runner could never accept.
 #
 # It submits no prompt and spends no tokens, so the shared live gate runs it by
-# default wherever a runner is installed. Run it after every Claude or Pi
-# upgrade and before trusting the "Worker account pin sign-in check" entry in
+# default wherever a runner is installed. Run it after every Claude, Codex, or
+# Pi upgrade and before trusting the "Worker account pin sign-in check" entry in
 # docs/verification/runtime-backends.md.
 set -u
 
@@ -30,7 +30,7 @@ TMP_ROOT=$(fm_test_tmproot fm-worker-account-live)
 # settings out of every answer.
 export HOME="$TMP_ROOT/home"
 mkdir -p "$HOME"
-unset CLAUDE_CONFIG_DIR PI_CODING_AGENT_DIR ANTHROPIC_API_KEY OPENAI_API_KEY FM_LIVE_EXT_KEY
+unset CLAUDE_CONFIG_DIR CODEX_HOME PI_CODING_AGENT_DIR ANTHROPIC_API_KEY OPENAI_API_KEY FM_LIVE_EXT_KEY
 CHECKED=
 
 claude_live_cases() {
@@ -111,22 +111,52 @@ pi_live_cases() {
   CHECKED="$CHECKED $exe"
 }
 
-for runner in claude pi pi-signed; do
+# Codex: `codex login status` reads only the selected CODEX_HOME (an ambient
+# OPENAI_API_KEY does not sign in an empty root), and `codex login
+# --with-api-key` stores a synthetic key offline. The pool reading must class
+# a root quota-axi cannot measure as unmeasured, never as measured headroom.
+codex_live_cases() {
+  local version empty keyed probe
+  version=$(codex --version 2>/dev/null | head -1)
+  empty="$TMP_ROOT/codex-empty"
+  keyed="$TMP_ROOT/codex-keyed"
+  mkdir -p "$empty" "$keyed"
+  printf 'sk-fm-live-synthetic' | env -i HOME="$HOME" PATH="$PATH" CODEX_HOME="$keyed" \
+    codex login --with-api-key >/dev/null 2>&1 ||
+    fail "$version: codex login --with-api-key no longer stores a key offline, so the accepted case below proves nothing"
+  if OPENAI_API_KEY=sk-fm-live-synthetic fm_worker_account_check codex "$empty" "$empty" codex 2>/dev/null; then
+    fail "$version: the pin check accepted an empty CODEX_HOME"
+  fi
+  fm_worker_account_check codex "$keyed" "$keyed" codex ||
+    fail "$version: the pin check refused a CODEX_HOME holding a stored login"
+  if command -v quota-axi >/dev/null 2>&1; then
+    probe=$(fm_worker_account_pool_probe codex "$empty")
+    [ "${probe%%$'\t'*}" = unmeasured ] ||
+      fail "$version: quota-axi $(quota-axi --version 2>/dev/null): an empty CODEX_HOME read as '$probe' instead of unmeasured"
+  else
+    printf 'skip-runner: quota-axi is not installed, so the pool reading was not exercised\n'
+  fi
+  pass "$version: the pin check accepts a signed-in CODEX_HOME and refuses an empty one, which the pool reads as unmeasured"
+  CHECKED="$CHECKED codex"
+}
+
+for runner in claude codex pi pi-signed; do
   if ! command -v "$runner" >/dev/null 2>&1; then
     printf 'skip-runner: %s is not installed, so its pin check was not exercised\n' "$runner"
     continue
   fi
   case "$runner" in
     claude) claude_live_cases ;;
+    codex) codex_live_cases ;;
     *) pi_live_cases "$runner" ;;
   esac
 done
 
 if [ -z "$CHECKED" ]; then
   if [ "${FM_WORKER_ACCOUNT_LIVE_E2E:-${FM_LIVE:-}}" = 1 ]; then
-    fail "the worker account live guard was requested but no supported runner (claude, pi, pi-signed) is installed"
+    fail "the worker account live guard was requested but no supported runner (claude, codex, pi, pi-signed) is installed"
   fi
-  echo "skip: live: no supported runner (claude, pi, pi-signed) installed"
+  echo "skip: live: no supported runner (claude, codex, pi, pi-signed) installed"
   exit 0
 fi
 echo "# worker account live guard checked:$CHECKED"

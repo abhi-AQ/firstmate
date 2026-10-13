@@ -45,7 +45,7 @@ relaunch_cleanup() {
   for d in "${TASK_TMPS[@]:-}"; do
     [ -n "$d" ] && rm -rf "$d"
   done
-  rm -rf "$TMP_ROOT"
+  fm_test_remove_tree "$TMP_ROOT"
 }
 trap relaunch_cleanup EXIT
 
@@ -812,6 +812,168 @@ test_worker_account_pin_follows_the_relaunch() {
   assert_not_contains "$(cat "$dir/fake/literal")" "CLAUDE_CONFIG_DIR=" \
     "an unpinned replacement must launch exactly as before"
   pass "fm-control relaunch: the replacement follows the home's current worker account pin"
+}
+
+# Account-pool rotation (bin/fm-account-rotate.sh): a worker whose pooled
+# account hits its usage limit is relaunched onto another pool account through
+# this same relaunch transaction, or waits for the earliest reset.
+
+# make_pool_world <case-dir> <harness> <id> <roots...>: a live <harness> ship on
+# the first root of a pool of signed-in roots, a fake quota-axi that answers
+# from each root's quota.json (and fails like the real tool without one), and
+# runner fakes whose sign-in checks read the selected root.
+make_pool_world() {
+  local dir=$1 harness=$2 id=$3 root
+  shift 3
+  add_ship_task "$dir" "$id" "$harness"
+  printf '%s' "$harness" > "$dir/fake/command"
+  printf '%s' "$harness" > "$dir/fake/becomes"
+  make_claude_auth_stub "$dir"
+  cat > "$dir/fakebin/codex" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = login ] && [ "${2:-}" = status ] || exit 0
+[ -f "${CODEX_HOME:-$HOME/.codex}/auth.json" ]
+SH
+  cat > "$dir/fakebin/quota-axi" <<'SH'
+#!/usr/bin/env bash
+case " $* " in *" --provider codex "*) root=$CODEX_HOME ;; *) root=$CLAUDE_CONFIG_DIR ;; esac
+[ -f "$root/quota.json" ] && exec cat "$root/quota.json"
+exit 1
+SH
+  chmod +x "$dir/fakebin/codex" "$dir/fakebin/quota-axi"
+  mkdir -p "$dir/home/config"
+  : > "$dir/home/config/$harness-account"
+  for root in "$@"; do
+    mkdir -p "$root"
+    : > "$root/.credentials.json"
+    : > "$root/auth.json"
+    printf '{"oauthAccount":{"accountUuid":"uuid-%s"}}\n' "${root##*/}" > "$root/.claude.json"
+    printf '%s\n' "$root" >> "$dir/home/config/$harness-account"
+  done
+  printf 'account=%s\n' "$1" >> "$dir/home/state/$id.meta"
+  printf 'working [at=%s]: under way\n' "$(date +%s)" > "$dir/home/state/$id.status"
+}
+
+# exhausted_reading <root> <percent> <reset-iso>
+exhausted_reading() {
+  cat > "$1/quota.json" <<JSON
+{"schemaVersion":5,"providers":[{"provider":"codex","account":{"accountId":"acct-${1##*/}"},
+ "windows":[{"id":"weekly","percentRemaining":$2,"resetsAt":"$3"}],"state":{"status":"fresh","stale":false},
+ "quotaSemantics":{"status":"known","effectiveAvailability":[{"scope":"all_models","status":"known",
+  "effectivePercentRemaining":$2,"runway":{"status":"through_reset"}}]}}]}
+JSON
+}
+
+run_rotate() {  # <case-dir> <args...>
+  local dir=$1; shift
+  mkdir -p "$dir/user-home"
+  env -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_SESSION -u HERDR_SOCKET_PATH \
+    -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID \
+    PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_FAKE_DIR="$dir/fake" \
+    HOME="$dir/user-home" CLAUDE_CONFIG_DIR='' CODEX_HOME='' \
+    FM_SPAWN_NO_GUARD=1 GROK_HOME="$dir/grokhome" \
+    FM_CONTROL_POLL=0.01 FM_CONTROL_EXIT_WAIT=0.05 FM_CONTROL_LAUNCH_WAIT=0.05 \
+    "$ROOT/bin/fm-account-rotate.sh" "$@" 2>&1
+}
+
+test_usage_limit_hint_relaunches_onto_another_pool_account() {
+  local dir out rc id=rl-pool-hint
+  dir=$(new_case pool-hint "$id")
+  make_pool_world "$dir" claude "$id" "$dir/acct-a" "$dir/acct-b"
+  run_rotate "$dir" hint "$dir/home/state" "$id" >/dev/null
+  assert_present "$dir/home/state/$id.account-limit" "the StopFailure hint should record the limit"
+  out=$(run_rotate "$dir" tick); rc=$?
+  expect_code 0 "$rc" "the rotation tick should succeed: $out"
+  assert_contains "$out" "check: $id moved to another account after a usage limit ($dir/acct-a -> $dir/acct-b)" \
+    "the tick should report the move"
+  [ "$(meta_field "$dir" "$id" account)" = "$dir/acct-b" ] || fail "the relaunched record should carry the new account"
+  assert_contains "$(cat "$dir/fake/literal")" "CLAUDE_CONFIG_DIR='$dir/acct-b'" \
+    "the replacement should launch under the other pool account"
+  assert_contains "$(cat "$dir/home/data/$id/brief.md")" "hit its usage limit" \
+    "the replacement's instructions should say why it was relaunched"
+  assert_absent "$dir/home/state/$id.account-limit" "a handled hint must be cleared"
+  : > "$dir/fake/literal"
+  out=$(run_rotate "$dir" tick); rc=$?
+  expect_code 0 "$rc" "a quiet tick should succeed: $out"
+  [ -z "$out" ] || fail "a tick with no new limit must stay silent: $out"
+  [ ! -s "$dir/fake/literal" ] || fail "a tick with no new limit must not touch the worker"
+  pass "fm-account-rotate: a usage-limit hint relaunches the worker onto another pool account"
+}
+
+test_exhausted_codex_reading_relaunches_onto_another_pool_account() {
+  local dir out rc id=rl-pool-codex
+  dir=$(new_case pool-codex "$id")
+  make_pool_world "$dir" codex "$id" "$dir/cx-a" "$dir/cx-b"
+  exhausted_reading "$dir/cx-a" 0 2099-01-01T00:00:00.000Z
+  exhausted_reading "$dir/cx-b" 70 2099-01-01T00:00:00.000Z
+  out=$(run_rotate "$dir" tick); rc=$?
+  expect_code 0 "$rc" "the rotation tick should succeed: $out"
+  assert_contains "$out" "check: $id moved to another account after a usage limit ($dir/cx-a -> $dir/cx-b)" \
+    "an exhausted reading alone should move a Codex worker"
+  assert_contains "$(cat "$dir/fake/literal")" "CODEX_HOME='$dir/cx-b'" \
+    "the replacement should launch under the other CODEX_HOME"
+  pass "fm-account-rotate: an exhausted Codex reading relaunches the worker onto another pool account"
+}
+
+test_exhausted_pool_waits_for_the_reset_with_one_notice() {
+  local dir out rc id=rl-pool-wait
+  dir=$(new_case pool-wait "$id")
+  make_pool_world "$dir" claude "$id" "$dir/acct-a" "$dir/acct-b"
+  # shellcheck disable=SC2016  # The inner shell expands its own positional arguments.
+  env FM_WORKER_ACCOUNT_STATE_DIR="$dir/home/state" HOME="$dir/user-home" PATH="$dir/fakebin:$PATH" bash -c \
+    '. "$1/bin/fm-worker-account-lib.sh" && fm_worker_account_pool_mark_limited claude "$2" 4102444800' \
+    _ "$ROOT" "$dir/acct-b" || fail "marking the other root limited should succeed"
+  run_rotate "$dir" hint "$dir/home/state" "$id" >/dev/null
+  out=$(run_rotate "$dir" tick); rc=$?
+  expect_code 0 "$rc" "the rotation tick should succeed: $out"
+  assert_contains "$out" "check: account pool claude is out of usage; 1 worker(s) waiting until" \
+    "an exhausted pool should raise one notice"
+  [ "$(printf '%s\n' "$out" | grep -c .)" -eq 1 ] || fail "only the pool notice should print: $out"
+  assert_present "$dir/home/state/$id.account-wait" "the worker should be recorded as waiting"
+  [ ! -s "$dir/fake/literal" ] || fail "a waiting worker must not be relaunched: $(cat "$dir/fake/literal")"
+  out=$(run_rotate "$dir" tick); rc=$?
+  [ -z "$out" ] || fail "the pool notice must not repeat within one episode: $out"
+  rm -f "$dir/home/state/account-pool/"*.limit
+  out=$(run_rotate "$dir" tick); rc=$?
+  expect_code 0 "$rc" "the tick after the reset should succeed: $out"
+  assert_absent "$dir/home/state/$id.account-wait" "a resumed worker is no longer waiting"
+  assert_contains "$(cat "$dir/home/state/$id.inbox/"*.msg)" "usage limit on your account has reset" \
+    "the waiting worker should be told to continue on its own account"
+  [ "$(meta_field "$dir" "$id" account)" = "$dir/acct-a" ] || fail "a resumed worker keeps its own account"
+  assert_absent "$dir/home/state/account-pool/claude.notice" "the episode notice clears once a worker resumes"
+  pass "fm-account-rotate: an exhausted pool waits for the reset with one notice, then resumes the worker"
+}
+
+test_watcher_relays_an_account_rotation_as_one_check_wake() {
+  local dir id=rl-pool-watch pid n=0
+  dir=$(new_case pool-watch "$id")
+  make_pool_world "$dir" claude "$id" "$dir/acct-a" "$dir/acct-b"
+  rm -f "$dir/home/state/$id.status"
+  touch "$dir/home/state/.last-watcher-beat"
+  run_rotate "$dir" hint "$dir/home/state" "$id" >/dev/null
+  mkdir -p "$dir/user-home"
+  env -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_SESSION -u HERDR_SOCKET_PATH \
+    -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID \
+    PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_FAKE_DIR="$dir/fake" \
+    HOME="$dir/user-home" CLAUDE_CONFIG_DIR='' CODEX_HOME='' FM_SPAWN_NO_GUARD=1 \
+    FM_CONTROL_POLL=0.01 FM_CONTROL_EXIT_WAIT=0.05 FM_CONTROL_LAUNCH_WAIT=0.05 \
+    FM_ACCOUNT_ROTATE_SECS=1 FM_POLL=1 FM_SIGNAL_GRACE=0 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$ROOT/bin/fm-watch.sh" > "$dir/watch.out" 2> "$dir/watch.err" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 1500 ]; do
+    /bin/sleep 0.02
+    n=$((n + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    fail "the watcher did not exit on the rotation wake: $(cat "$dir/watch.err")"
+  fi
+  wait "$pid" || fail "the watcher exited non-zero: $(cat "$dir/watch.err")"
+  assert_grep "check: $id moved to another account after a usage limit" "$dir/watch.out" \
+    "the watcher should surface the move: out=$(cat "$dir/watch.out") err=$(cat "$dir/watch.err")"
+  grep -F $'\tcheck\taccount-rotation-' "$dir/home/state/.wake-queue" >/dev/null \
+    || fail "the move should be a durable check wake row: $(cat "$dir/home/state/.wake-queue" 2>/dev/null)"
+  pass "the watcher relays an account rotation as one durable check wake"
 }
 
 test_pi_exclude_tools_follow_the_relaunch() {
@@ -2606,3 +2768,7 @@ test_herdr_reclaim_of_a_secondmate_names_its_own_owner
 test_herdr_rebind_failure_from_a_plain_shell_names_the_real_cause
 test_relaunch_reverifies_an_already_in_flight_item_instead_of_rewriting_it
 test_relaunch_moves_a_drifted_item_back_in_flight
+test_usage_limit_hint_relaunches_onto_another_pool_account
+test_exhausted_codex_reading_relaunches_onto_another_pool_account
+test_exhausted_pool_waits_for_the_reset_with_one_notice
+test_watcher_relays_an_account_rotation_as_one_check_wake

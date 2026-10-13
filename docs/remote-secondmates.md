@@ -128,7 +128,7 @@ It never touches a worker whose checkout still exists.
 ### What the remote account must provide
 
 - The remote account must provide the required toolchain, the selected worker runtime, the selected session backend, and credentials that work on that host.
-- A [worker account pin](configuration.md#worker-account-pin-configclaude-account-configpi-account) for the second mate or its workers lives in the remote home's own configuration on that host.
+- A [worker account pin](configuration.md#worker-account-pin-configclaude-account-configcodex-account-configpi-account) for the second mate or its workers lives in the remote home's own configuration on that host.
 - The origin URL named for each project must be reachable from the remote account, because projects are cloned on that host rather than copied from the primary.
 
 ## Non-interactive tool contract
